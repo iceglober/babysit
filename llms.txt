@@ -1,0 +1,18 @@
+# babysit
+
+MCP tools that help coding agents manage GitHub pull requests until they merge.
+Use status and wait calls instead of repeated shell commands or sleep loops.
+
+Run: npx -y --package=github:iceglober/babysit babysit
+Needs Node 20+, npm, Git, and an authenticated GitHub CLI (gh).
+
+Loop: babysit_status(pr) -> do what NEXT says -> babysit_wait(pr) -> repeat until done.
+Pass a PR URL, owner/name#number, or a number with repo: "owner/name".
+Use babysit_watch for several pull requests.
+Only request a merge when the user authorizes it. Use dry_run: true to preview actions.
+
+Repository configuration: .agent/.babysit.json
+mergeQueue: "github", "mergify", null, or omitted. Mergify requires an explicit choice.
+
+- README.md: Installation, configuration fields, and tool behavior.
+- skills/babysit/SKILL.md: Agent workflow and rules for handling results.
