@@ -1,6 +1,8 @@
 // Turns raw PR data into a digest: where the PR stands and the one thing to do next.
 // Pure functions over plain data so the decision logic is testable without GitHub.
 
+import { DEFAULT_CONFIG, ignoredChecks, type Config } from './config.js';
+
 export type CheckStatus = 'success' | 'failure' | 'pending' | 'skipped';
 
 export interface Check {
@@ -86,6 +88,7 @@ export interface Digest {
 }
 
 export interface Extras {
+  config?: Config;
   /** check name -> tail of its failed log */
   logs?: Map<string, string>;
   /** check names currently failing on the base branch head */
@@ -93,8 +96,6 @@ export interface Extras {
 }
 
 const MERGIFY_QUEUE_CHECK = 'Mergify Merge Queue';
-// Mergify's own gate checks fail because other checks fail; they're never the thing to fix.
-const DERIVED_CHECKS = new Set([MERGIFY_QUEUE_CHECK, 'Mergify Merge Protections']);
 
 function checkRunStatus(status: string, conclusion: string | null): CheckStatus {
   if (status !== 'COMPLETED') return 'pending';
@@ -205,13 +206,10 @@ export function parseMergify(raw: any, checks: Check[]): Queue {
   };
 }
 
-export function parseQueue(raw: any, checks: Check[]): Queue {
-  const usesMergify =
-    checks.some((c) => c.name.startsWith('Mergify')) ||
-    (raw.comments?.nodes ?? []).some((c: any) => /^mergify/i.test(c.author?.login ?? ''));
-  if (usesMergify) return parseMergify(raw, checks);
-  const entry = raw.mergeQueueEntry;
-  const removals = (raw.timelineItems?.nodes ?? []).filter((n: any) => n?.createdAt);
+export function parseQueue(raw: any, checks: Check[], config: Config = DEFAULT_CONFIG): Queue {
+  if (config.mergeQueue === 'mergify') return parseMergify(raw, checks);
+  const entry = config.mergeQueue === 'github' ? raw.mergeQueueEntry : undefined;
+  const removals = config.mergeQueue === 'github' ? (raw.timelineItems?.nodes ?? []).filter((n: any) => n?.createdAt) : [];
   const lastRemoval = removals[removals.length - 1];
   if (entry || raw.autoMergeRequest || lastRemoval) {
     return {
@@ -251,7 +249,7 @@ function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
 
-export function decide(d: Omit<Digest, 'next' | 'actionable' | 'fingerprint'>): NextAction {
+export function decide(d: Omit<Digest, 'next' | 'actionable' | 'fingerprint'>, config: Config = DEFAULT_CONFIG): NextAction {
   if (d.state === 'merged') return { kind: 'done', summary: 'Merged.' };
   if (d.state === 'closed') return { kind: 'closed', summary: 'Closed without merging.' };
   if (d.mergeable === 'CONFLICTING' || d.mergeState === 'DIRTY') {
@@ -290,6 +288,9 @@ export function decide(d: Omit<Digest, 'next' | 'actionable' | 'fingerprint'>): 
     return { kind: 'requeue', summary: `Removed from the merge queue: ${d.queue.removed.reason}. Fix the cause, then re-queue.`, tool: 'babysit_enqueue' };
   }
   if (d.queue.inQueue) {
+    if (d.queue.state === 'AUTO_MERGE') {
+      return { kind: 'wait_queue', summary: 'GitHub auto-merge is enabled. Wait for GitHub to merge the PR.', tool: 'babysit_wait' };
+    }
     const what = d.queue.waitingFor.length ? ` Waiting for: ${d.queue.waitingFor.slice(0, 4).join('; ')}.` : '';
     const eta = d.queue.eta ? ` ETA ${d.queue.eta}.` : '';
     return { kind: 'wait_queue', summary: `In the merge queue${d.queue.state ? ` (${d.queue.state})` : ''}.${what}${eta}`, tool: 'babysit_wait' };
@@ -300,13 +301,15 @@ export function decide(d: Omit<Digest, 'next' | 'actionable' | 'fingerprint'>): 
     return { kind: 'wait_checks', summary: `${plural(d.checks.pending.length, 'check')} still running${req}.`, tool: 'babysit_wait' };
   }
   if (d.reviewDecision === 'REVIEW_REQUIRED') return { kind: 'needs_review', summary: 'Waiting on an approving review from a human.' };
-  return { kind: 'enqueue', summary: 'Green and mergeable. Add it to the merge queue.', tool: 'babysit_enqueue' };
+  return { kind: 'enqueue', summary: config.mergeQueue ? 'Green and mergeable. Add it to the merge queue.' : 'Green and mergeable. Request GitHub auto-merge.', tool: 'babysit_enqueue' };
 }
 
 const WAITING: ActionKind[] = ['wait_checks', 'wait_queue', 'needs_review'];
 
 export function buildDigest(raw: any, extras: Extras = {}): Digest {
-  const checks = allChecks(raw).filter((c) => !DERIVED_CHECKS.has(c.name));
+  const config = extras.config ?? DEFAULT_CONFIG;
+  const ignored = ignoredChecks(config);
+  const checks = allChecks(raw).filter((c) => !ignored.has(c.name));
   for (const c of checks) {
     if (c.status !== 'failure') continue;
     c.logTail = extras.logs?.get(c.name);
@@ -333,9 +336,9 @@ export function buildDigest(raw: any, extras: Extras = {}): Digest {
     reviewDecision: raw.reviewDecision ?? null,
     checks: { counts, failing, pending, requiredPending: pending.filter((c) => c.required).length },
     threads: threadsOf(raw),
-    queue: parseQueue(raw, allChecks(raw)),
+    queue: parseQueue(raw, allChecks(raw), config),
   } as Omit<Digest, 'next' | 'actionable' | 'fingerprint'>;
-  const next = decide(base);
+  const next = decide(base, config);
   const fingerprint = JSON.stringify({
     s: base.state,
     m: base.mergeable,
@@ -369,7 +372,7 @@ export function render(d: Digest, opts: { logLines?: number } = {}): string {
       .filter(Boolean)
       .join(', ');
     out.push(`FAILING ${f.workflow ? `${f.workflow} / ` : ''}${f.name} (${tags}) ${f.url ?? ''}`);
-    if (f.logTail) {
+    if (f.logTail && opts.logLines !== 0) {
       const lines = f.logTail.split('\n').slice(-(opts.logLines ?? 25));
       out.push(...lines.map((l) => `    | ${l}`));
     }

@@ -137,6 +137,7 @@ const logCache = new Map<string, string>();
 
 /** Tail of the failed-step log for one job of a workflow run. Empty if unavailable. */
 export async function failedLogTail(ref: PrRef, runId: number, jobName: string, lines = 40, jobUrl?: string): Promise<string> {
+  if (lines === 0) return '';
   const jobId = jobUrl?.match(/\/job\/(\d+)(?:$|[?#])/ )?.[1];
   const key = `${ref.owner}/${ref.name}:${runId}:${jobName}`;
   let log = logCache.get(key);
@@ -154,6 +155,7 @@ export async function failedLogTail(ref: PrRef, runId: number, jobName: string, 
 }
 
 export function failedStepLogTail(log: string, jobName: string, lines: number): string {
+  if (lines === 0) return '';
   const rows = log.split('\n').filter((line) => line.startsWith(`${jobName}\t`)).map((line) => {
     const parts = line.split('\t');
     return { step: parts[1], text: parts.slice(2).join('\t').replace(/^\S+Z /, '').replace(/\x1b\[[0-9;]*m/g, '') };

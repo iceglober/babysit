@@ -1,71 +1,173 @@
 # babysit
 
-An MCP server that lets coding agents shepherd GitHub pull requests to merge without polling.
+babysit helps coding agents manage GitHub pull requests until they merge. It reports what needs attention and waits for changes.
 
-Agents spend a lot of turns watching PRs: in one day of Claude Code and Codex sessions, 258 of 2,291 shell commands (11%) were `gh pr checks`, `gh pr view`, `gh run view`, `gh api` and sleep loops. babysit replaces that with one digest call and one blocking wait.
+It runs as an MCP server. MCP connects an agent to tools. babysit uses the GitHub CLI, `gh`, with your existing sign-in.
 
-```
+The agent follows this loop:
+
+```text
 babysit_status(pr) → do what NEXT says → babysit_wait(pr) → repeat until NEXT is "done"
 ```
 
-## Tools
-
-| tool | what it does |
-|---|---|
-| `babysit_status` | One-call digest: the next action, failing checks with the tail of their failed log and a likely-flaky hint, unresolved review threads, conflicts, merge-queue state. |
-| `babysit_wait` | Blocks until the PR needs the agent: a check fails, checks finish, a new review comment, a conflict, removal from the queue, merge or close. After `max_minutes` (default 8) it returns the current state; call again to keep waiting. |
-| `babysit_watch` | The same for up to 30 PRs at once; returns when any needs attention, ordered by urgency. For sessions running many subagents. |
-| `babysit_rerun_failed` | Reruns failed GitHub Actions jobs on the head commit. With `only_flaky` or `checks`, reruns only those jobs. |
-| `babysit_update_branch` | `gh pr update-branch` (merge commit, or `rebase: true`). Refuses on conflicts. |
-| `babysit_enqueue` | Comments `@mergifyio queue` on Mergify repos, otherwise `gh pr merge --auto`. Refuses drafts, conflicts, failing checks and unresolved threads unless `force: true`. |
-
-The three action tools take `dry_run: true` to show the `gh` command without running it.
-
-`pr` can be a number, `owner/name#number`, or a PR URL. A bare number uses the repo of the server's working directory, or pass `repo: "owner/name"`.
-
-## Next actions
-
-In priority order: `done`, `closed`, `resolve_conflicts`, `fix_checks`, `rerun_flaky`, `address_reviews`, `changes_requested`, `mark_ready`, `requeue`, `wait_queue`, `update_branch`, `wait_checks`, `needs_review`, `enqueue`.
-
-A failing check is flagged likely flaky when its conclusion is timed-out, cancelled or failed-to-start, or its log matches an infrastructure failure (runner lost, network error, upstream 5xx or rate limit, timeout, out of memory). A failure that is also red on the base branch's head is called out as probably not caused by the PR.
-
-## Merge queues
-
-- **GitHub merge queue / auto-merge:** read from `mergeQueueEntry`, `autoMergeRequest` and removal events.
-- **Mergify:** read from Mergify's status comment payload (queue state, ETA, unmet conditions) and the `Mergify Merge Queue` check. Mergify's own gate checks (`Mergify Merge Queue`, `Mergify Merge Protections`) are never reported as things to fix.
+babysit polls GitHub for the agent. The agent does not need repeated shell commands or sleep loops.
 
 ## Install
 
-Needs Node 20+ and an authenticated `gh` (`gh auth status`). babysit never sees a token; everything goes through `gh`.
+You need Node 20 or later and an authenticated `gh`. Run `gh auth status` to make sure that you are signed in.
+
+Clone this repository. In its root directory, run:
 
 ```sh
 npm install && npm run build
 ```
 
-Claude Code (all projects):
+To add babysit to Claude Code for all projects, run:
 
 ```sh
 claude mcp add --scope user babysit -- node ~/repos/iceglober/babysit/dist/src/index.js
 ```
 
-Codex, in `~/.codex/config.toml`:
+For Codex, add this section to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.babysit]
 command = "node"
 args = ["/Users/<you>/repos/iceglober/babysit/dist/src/index.js"]
-tool_timeout_sec = 900   # babysit_wait blocks for up to max_minutes
+tool_timeout_sec = 900
 ```
 
-Keep `max_minutes` under your client's MCP tool timeout. babysit sends progress notifications while waiting, which some clients use to keep the call alive.
+Replace the path with your local build path. Start the server in the repository that you want it to watch.
 
-## Cost
+Keep `max_minutes` below your client's tool timeout. babysit sends progress messages while it waits.
 
-One GraphQL query per PR per poll (about 1 point of the 5,000/hour budget), plus `gh run view --log-failed` once per failing run (cached). `babysit_wait` polls every 30s by default; `babysit_watch` every 45s.
+## Repository configuration
+
+Create `.agent/.babysit.json` in the root of each repository that uses babysit. JSON keeps the configuration as data, not executable code.
+
+This example shows all fields with their default values:
+
+```json
+{
+  "mergeQueue": null,
+  "mergeMethod": "squash",
+  "checks": {
+    "ignored": [],
+    "logLines": 25
+  },
+  "polling": {
+    "maxMinutes": 8,
+    "waitSeconds": 30,
+    "watchSeconds": 45
+  }
+}
+```
+
+All fields are optional. Without the file, babysit uses the defaults above. Invalid JSON, unknown fields, and invalid values stop the tool call.
+
+| Field | Meaning | Allowed values |
+| --- | --- | --- |
+| `mergeQueue` | The service that queues the pull request | `"github"`, `"mergify"`, `null`, or omitted |
+| `mergeMethod` | The merge method when GitHub uses auto-merge without a queue | `squash`, `merge`, or `rebase` |
+| `checks.ignored` | Exact check names to exclude from results and actions | An array of nonempty strings |
+| `checks.logLines` | The number of failed log lines to report per check | An integer from 0 to 200 |
+| `polling.maxMinutes` | How long a wait or watch call runs | A number from 0.5 to 60 |
+| `polling.waitSeconds` | The time between GitHub requests for `babysit_wait` | An integer from 10 to 300 |
+| `polling.watchSeconds` | The time between GitHub requests for `babysit_watch` | An integer from 15 to 300 |
+
+Tool arguments override the corresponding defaults in the configuration. For example, `poll_seconds` overrides the interval for that call.
+
+Omitted `mergeQueue` and `null` both mean no merge queue. JSON does not support `undefined`. Omit the field to represent it.
+
+For a watch call across repositories, babysit uses the shortest configured duration and interval. Explicit tool arguments still take priority.
+
+Ignored checks do not block actions, appear in results, or receive rerun requests. Ignore a check only when it is safe to exclude it.
+
+### Where babysit reads the file
+
+If the current checkout's `origin` identifies the target repository, babysit reads its local file. This also works from a subdirectory.
+
+For another repository, babysit reads the file from that repository's default branch through GitHub. It does not read configuration from the pull request branch.
+
+A missing file uses defaults. Other read errors stop the call. babysit reads the configuration at the start of each tool call.
+
+### Mergify
+
+Mergify is optional. babysit does not select it from comments, check names, or Mergify configuration files.
+
+For a repository that uses Mergify, set:
+
+```json
+{
+  "mergeQueue": "mergify"
+}
+```
+
+With this configuration, babysit reads Mergify's queue status and posts `@mergifyio queue` to request a merge.
+
+It excludes `Mergify Merge Queue` and `Mergify Merge Protections` from normal check results.
+
+These two checks report the state of other requirements. They are not separate test failures to fix.
+
+With `"mergeQueue": "github"`, babysit reads GitHub's merge queue. It uses `gh pr merge --auto` to request a merge through that queue.
+
+Without a merge queue, babysit uses GitHub auto-merge with `mergeMethod`. GitHub controls whether auto-merge is available for the repository.
+
+## Tools
+
+| Tool | What it does |
+| --- | --- |
+| `babysit_status` | Reports the next action, failed checks, failed logs, review threads, conflicts, and queue state. |
+| `babysit_wait` | Waits for a change that needs attention, a merge, or a close. Returns the current state when its time limit ends. |
+| `babysit_watch` | Watches up to 30 pull requests. Returns when one needs attention, with the most urgent results first. |
+| `babysit_rerun_failed` | Reruns failed GitHub Actions jobs. Use `only_flaky` or `checks` to limit the selection. |
+| `babysit_update_branch` | Updates the branch with `gh pr update-branch`. Uses a merge commit unless you pass `rebase: true`. Refuses conflicts. |
+| `babysit_enqueue` | Requests a merge through the configured queue or GitHub auto-merge. Refuses drafts, conflicts, failed checks, and unresolved threads unless you pass `force: true`. |
+
+The three tools that change GitHub accept `dry_run: true`. This shows the command without running it.
+
+For `pr`, pass a number, `owner/name#number`, or a pull request URL. A bare number uses the current checkout's `origin`.
+
+If the server runs outside the target repository, pass `repo: "owner/name"` with a bare number. A full pull request URL also works.
+
+## Read the result
+
+`NEXT` names the next action. babysit chooses actions in this order:
+
+```text
+done, closed, resolve_conflicts, fix_checks, rerun_flaky,
+address_reviews, changes_requested, mark_ready, requeue,
+wait_queue, update_branch, wait_checks, needs_review, enqueue
+```
+
+A flaky check is a failure that can pass without a code change. babysit reports this as a hint, not proof.
+
+The hints include lost runners, network errors, upstream service errors, rate limits, timeouts, and memory limits. Cancelled jobs and jobs that fail to start also receive hints.
+
+If a check also fails on the base branch, babysit reports that fact. The pull request is not necessarily the cause.
+
+## GitHub requests
+
+Each poll uses one GraphQL query per pull request. A query costs about one point of GitHub's usual 5,000-point hourly budget.
+
+babysit also reads failed job logs and compares failed checks with the base branch. It caches available logs to avoid repeated downloads.
+
+Each remote pull request adds one configuration request at the start of a tool call. The wait and watch intervals come from the configuration or tool arguments.
 
 ## Development
 
+In the babysit repository root, run the tests:
+
 ```sh
-npm test                                   # unit tests on synthetic PR data
-BABYSIT_CWD=/path/to/repo node scripts/smoke.mjs --tools babysit_status '{"pr":123}'   # live, over real MCP stdio
+npm test
 ```
+
+The tests use synthetic pull request data and temporary local repositories. They do not change GitHub.
+
+To test a live tool through MCP, build babysit and run:
+
+```sh
+BABYSIT_CWD=/path/to/repo node scripts/smoke.mjs --tools babysit_status '{"pr":123}'
+```
+
+Replace the path and pull request number with a repository that you can access. This command reads GitHub without changing the pull request.

@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { buildDigest, flakyHints, render } from '../src/digest.js';
+import { parseConfig } from '../src/config.js';
+
+const mergify = parseConfig('{"mergeQueue":"mergify"}');
 
 type Over = Record<string, unknown>;
 
@@ -123,7 +126,7 @@ test('a real failure wins over a flaky one', () => {
 });
 
 test("mergify's derived protection check is not something to fix", () => {
-  const d = buildDigest(pr({}, [check('test', 'COMPLETED', 'SUCCESS'), check('Mergify Merge Protections', 'COMPLETED', 'FAILURE', { checkSuite: null })]));
+  const d = buildDigest(pr({}, [check('test', 'COMPLETED', 'SUCCESS'), check('Mergify Merge Protections', 'COMPLETED', 'FAILURE', { checkSuite: null })]), { config: mergify });
   assert.equal(d.checks.failing.length, 0);
   assert.equal(d.next.kind, 'enqueue');
 });
@@ -159,7 +162,7 @@ test('mergify queue: in queue, with what it waits for', () => {
     { comments: { nodes: [{ author: { login: 'mergify' }, body: MERGIFY_BODY, createdAt: 'x', url: 'u' }] } },
     [check('test', 'IN_PROGRESS', null), check('Mergify Merge Queue', 'IN_PROGRESS', null, { checkSuite: null })],
   );
-  const d = buildDigest(raw);
+  const d = buildDigest(raw, { config: mergify });
   assert.equal(d.queue.provider, 'mergify');
   assert.equal(d.queue.inQueue, true);
   assert.equal(d.queue.state, 'checking');
@@ -176,16 +179,51 @@ test('mergify queue: dropped from queue asks for a requeue with the reason', () 
     check('test', 'COMPLETED', 'SUCCESS'),
     check('Mergify Merge Queue', 'COMPLETED', 'FAILURE', { title: 'The pull request has been removed from the queue: checks failed on the draft', checkSuite: null }),
   ]);
-  const d = buildDigest(raw);
+  const d = buildDigest(raw, { config: mergify });
   assert.equal(d.next.kind, 'requeue');
   assert.match(d.next.summary, /checks failed on the draft/);
 });
 
 test('github merge queue entry', () => {
-  const d = buildDigest(pr({ mergeQueueEntry: { position: 3, state: 'QUEUED', estimatedTimeToMerge: 600 } }));
+  const d = buildDigest(pr({ mergeQueueEntry: { position: 3, state: 'QUEUED', estimatedTimeToMerge: 600 } }), { config: parseConfig('{"mergeQueue":"github"}') });
   assert.equal(d.queue.provider, 'github');
   assert.equal(d.next.kind, 'wait_queue');
   assert.match(d.next.summary, /ETA 10 min/);
+});
+
+test('an explicit GitHub queue ignores Mergify comments without hiding its checks', () => {
+  const raw = pr({
+    comments: { nodes: [{ author: { login: 'mergify' }, body: MERGIFY_BODY }] },
+    mergeQueueEntry: { position: 1, state: 'QUEUED' },
+  }, [check('Mergify Merge Protections', 'COMPLETED', 'FAILURE', { checkSuite: null })]);
+  const d = buildDigest(raw, { config: parseConfig('{"mergeQueue":"github"}') });
+  assert.equal(d.queue.provider, 'github');
+  assert.equal(d.checks.failing[0].name, 'Mergify Merge Protections');
+  assert.equal(d.next.kind, 'fix_checks');
+});
+
+test('omitted and null mergeQueue do not select a queue from PR data', () => {
+  for (const config of [parseConfig('{}'), parseConfig('{"mergeQueue":null}')]) {
+    const d = buildDigest(pr({
+      mergeQueueEntry: { position: 1, state: 'QUEUED' },
+      comments: { nodes: [{ author: { login: 'mergify' }, body: MERGIFY_BODY }] },
+    }), { config });
+    assert.equal(d.queue.provider, null);
+    assert.equal(d.queue.inQueue, false);
+    const autoMerge = buildDigest(pr({ autoMergeRequest: { enabledAt: 'now' } }), { config });
+    assert.equal(autoMerge.queue.state, 'AUTO_MERGE');
+  }
+});
+
+test('ignored checks do not count, block, or change the fingerprint', () => {
+  const config = parseConfig('{"checks":{"ignored":["optional"]}}');
+  const clean = buildDigest(pr(), { config });
+  const d = buildDigest(pr({}, [check('test', 'COMPLETED', 'SUCCESS'), check('optional', 'COMPLETED', 'FAILURE')]), { config });
+  assert.deepEqual(d.checks, clean.checks);
+  assert.equal(d.fingerprint, clean.fingerprint);
+  assert.equal(d.next.kind, 'enqueue');
+  const pending = buildDigest(pr({}, [check('optional', 'IN_PROGRESS', null)]), { config });
+  assert.equal(pending.checks.pending.length, 0);
 });
 
 test('fingerprint changes on new failure or reply, not on unrelated churn', () => {

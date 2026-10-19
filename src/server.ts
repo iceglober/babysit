@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
+import { ignoredChecks, loadConfig, type Config } from './config.js';
 import { type Digest, allChecks, buildDigest, render } from './digest.js';
 import { GhError, type PrRef, failedLogTail, failingOnBranch, fetchPr, gh, resolvePr } from './github.js';
 
@@ -17,10 +18,11 @@ type Extra = { signal?: AbortSignal; _meta?: { progressToken?: string | number }
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] });
 const fail = (e: unknown) => ({ content: [{ type: 'text' as const, text: `error: ${e instanceof Error ? e.message : String(e)}` }], isError: true });
 
-async function digestFor(ref: PrRef, withLogs: boolean, logLines = 40): Promise<Digest> {
+async function digestFor(ref: PrRef, config: Config, withLogs: boolean, logLines = config.checks.logLines): Promise<Digest> {
   const raw = await fetchPr(ref);
-  const failing = allChecks(raw).filter((c) => c.status === 'failure' && !c.name.startsWith('Mergify'));
-  if (!withLogs || failing.length === 0 || raw.merged || raw.state === 'CLOSED') return buildDigest(raw);
+  const ignored = ignoredChecks(config);
+  const failing = allChecks(raw).filter((c) => c.status === 'failure' && !ignored.has(c.name));
+  if (!withLogs || failing.length === 0 || raw.merged || raw.state === 'CLOSED') return buildDigest(raw, { config });
   const logs = new Map<string, string>();
   await Promise.all(
     failing
@@ -32,7 +34,7 @@ async function digestFor(ref: PrRef, withLogs: boolean, logLines = 40): Promise<
       }),
   );
   const baseFailing = await failingOnBranch(ref, raw.baseRefName).catch(() => undefined);
-  return buildDigest(raw, { logs, baseFailing });
+  return buildDigest(raw, { logs, baseFailing, config });
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -55,23 +57,9 @@ const prArg = z.union([z.string(), z.number()]).describe('PR number, owner/name#
 const repoArg = z.string().optional().describe('owner/name, when pr is a bare number and the server is not running inside that repo');
 const dryRunArg = z.boolean().optional().describe('Show the gh command without running it');
 
-const repoUsesMergify = new Map<string, boolean>();
-async function usesMergify(ref: PrRef, d: Digest): Promise<boolean> {
-  if (d.queue.provider === 'mergify') return true;
-  if (d.queue.provider === 'github') return false;
-  const key = `${ref.owner}/${ref.name}`;
-  if (!repoUsesMergify.has(key)) {
-    let found = false;
-    for (const path of ['.mergify.yml', '.github/mergify.yml', '.mergify/config.yml']) {
-      const ok = await gh(['api', `repos/${key}/contents/${path}`, '--silent']).then(() => true, () => false);
-      if (ok) {
-        found = true;
-        break;
-      }
-    }
-    repoUsesMergify.set(key, found);
-  }
-  return repoUsesMergify.get(key)!;
+async function contextFor(pr: string | number, repo?: string) {
+  const ref = await resolvePr(pr, repo);
+  return { ref, config: await loadConfig(ref) };
 }
 
 export function createServer(): McpServer {
@@ -83,13 +71,14 @@ export function createServer(): McpServer {
       title: 'PR status and next action',
       description:
         'One-call digest of a pull request: the single next action, failing checks with their failed-log tail and flaky hints, unresolved review threads, conflicts, and merge-queue state (GitHub or Mergify).',
-      inputSchema: { pr: prArg, repo: repoArg, log_lines: z.number().int().min(0).max(200).optional().describe('Failed-log lines per failing check (default 25)') },
+      inputSchema: { pr: prArg, repo: repoArg, log_lines: z.number().int().min(0).max(200).optional().describe('Failed-log lines per failing check (configuration default: 25)') },
       annotations: { readOnlyHint: true },
     },
     async ({ pr, repo, log_lines }) => {
       try {
-        const ref = await resolvePr(pr, repo);
-        return text(render(await digestFor(ref, true, log_lines ?? 25), { logLines: log_lines ?? 25 }));
+        const { ref, config } = await contextFor(pr, repo);
+        const logLines = log_lines ?? config.checks.logLines;
+        return text(render(await digestFor(ref, config, true, logLines), { logLines }));
       } catch (e) {
         return fail(e);
       }
@@ -106,31 +95,32 @@ export function createServer(): McpServer {
         pr: prArg,
         repo: repoArg,
         until: z.enum(['actionable', 'done']).optional().describe('"actionable" (default): return on anything needing you. "done": only on merge or close.'),
-        max_minutes: z.number().min(0.5).max(60).optional().describe('Give up and return the current state after this long (default 8). Keep it under your MCP client tool timeout.'),
-        poll_seconds: z.number().int().min(10).max(300).optional().describe('GitHub polling interval (default 30)'),
+        max_minutes: z.number().min(0.5).max(60).optional().describe('Return the current state after this many minutes (configuration default: 8). Keep it under your MCP client tool timeout.'),
+        poll_seconds: z.number().int().min(10).max(300).optional().describe('GitHub polling interval (configuration default: 30 seconds)'),
       },
       annotations: { readOnlyHint: true },
     },
     async ({ pr, repo, until, max_minutes, poll_seconds }, extra: Extra) => {
       try {
-        const ref = await resolvePr(pr, repo);
-        const start = await digestFor(ref, false);
-        if (start.state !== 'open') return text(render(await digestFor(ref, true)));
-        const deadline = Date.now() + (max_minutes ?? 8) * 60_000;
+        const { ref, config } = await contextFor(pr, repo);
+        const start = await digestFor(ref, config, false);
+        if (start.state !== 'open') return text(render(await digestFor(ref, config, true), { logLines: config.checks.logLines }));
+        const maxMinutes = max_minutes ?? config.polling.maxMinutes;
+        const deadline = Date.now() + maxMinutes * 60_000;
         let n = 0;
         while (Date.now() < deadline && !extra.signal?.aborted) {
-          await sleep(Math.min((poll_seconds ?? 30) * 1000, Math.max(0, deadline - Date.now())), extra.signal);
+          await sleep(Math.min((poll_seconds ?? config.polling.waitSeconds) * 1000, Math.max(0, deadline - Date.now())), extra.signal);
           if (extra.signal?.aborted) break;
-          const d = await digestFor(ref, false);
+          const d = await digestFor(ref, config, false);
           await progress(extra, ++n, `${d.next.kind}: ${d.next.summary}`);
-          if (d.state !== 'open') return text(render(await digestFor(ref, true)));
+          if (d.state !== 'open') return text(render(await digestFor(ref, config, true), { logLines: config.checks.logLines }));
           if (until !== 'done' && d.actionable && d.fingerprint !== start.fingerprint) {
-            return text(`Changed: needs you now.\n${render(await digestFor(ref, true))}`);
+            return text(`Changed: needs you now.\n${render(await digestFor(ref, config, true), { logLines: config.checks.logLines })}`);
           }
         }
-        const d = await digestFor(ref, true);
-        const mins = Math.round(((max_minutes ?? 8) * 10)) / 10;
-        return text(`No new action needed after ${mins} min; call babysit_wait again to keep waiting.\n${render(d)}`);
+        const d = await digestFor(ref, config, true);
+        const mins = Math.round(maxMinutes * 10) / 10;
+        return text(`No new action needed after ${mins} min; call babysit_wait again to keep waiting.\n${render(d, { logLines: config.checks.logLines })}`);
       } catch (e) {
         return fail(e);
       }
@@ -146,15 +136,15 @@ export function createServer(): McpServer {
       inputSchema: {
         prs: z.array(z.union([z.string(), z.number()])).min(1).max(30).describe('PR numbers, owner/name#number, or URLs'),
         repo: repoArg,
-        max_minutes: z.number().min(0.5).max(60).optional().describe('Default 8'),
-        poll_seconds: z.number().int().min(15).max(300).optional().describe('Default 45'),
+        max_minutes: z.number().min(0.5).max(60).optional().describe('Overrides the shortest configured duration (default: 8 minutes)'),
+        poll_seconds: z.number().int().min(15).max(300).optional().describe('Overrides the shortest configured watch interval (default: 45 seconds)'),
       },
       annotations: { readOnlyHint: true },
     },
     async ({ prs, repo, max_minutes, poll_seconds }, extra: Extra) => {
       try {
-        const refs = await Promise.all(prs.map((p) => resolvePr(p, repo)));
-        const snap = async () => Promise.all(refs.map((r) => digestFor(r, false).catch((e) => e as Error)));
+        const contexts = await Promise.all(prs.map((p) => contextFor(p, repo)));
+        const snap = async () => Promise.all(contexts.map(({ ref, config }) => digestFor(ref, config, false).catch((e) => e as Error)));
         const start = await snap();
         const startFp = start.map((d) => (d instanceof Error ? '' : d.fingerprint));
         const urgency = (d: Digest | Error) => (d instanceof Error ? 0 : d.actionable ? 1 : 2);
@@ -166,16 +156,19 @@ export function createServer(): McpServer {
             .sort((a, b) => Number(changed.has(b.i)) - Number(changed.has(a.i)) || urgency(a.d) - urgency(b.d))
             .map(({ d, i }) => `${changed.has(i) ? '* ' : '  '}${line(d, i)}`)
             .join('\n');
-        const deadline = Date.now() + (max_minutes ?? 8) * 60_000;
+        // A shared watch uses the shortest configured duration and interval.
+        const maxMinutes = max_minutes ?? Math.min(...contexts.map(({ config }) => config.polling.maxMinutes));
+        const pollSeconds = poll_seconds ?? Math.min(...contexts.map(({ config }) => config.polling.watchSeconds));
+        const deadline = Date.now() + maxMinutes * 60_000;
         let n = 0;
         while (Date.now() < deadline && !extra.signal?.aborted) {
-          await sleep(Math.min((poll_seconds ?? 45) * 1000, Math.max(0, deadline - Date.now())), extra.signal);
+          await sleep(Math.min(pollSeconds * 1000, Math.max(0, deadline - Date.now())), extra.signal);
           if (extra.signal?.aborted) break;
           const now = await snap();
           const changed = new Set(
             now.map((d, i) => (!(d instanceof Error) && (d.state !== 'open' || (d.actionable && d.fingerprint !== startFp[i])) ? i : -1)).filter((i) => i >= 0),
           );
-          await progress(extra, ++n, `${changed.size} of ${refs.length} need attention`);
+          await progress(extra, ++n, `${changed.size} of ${contexts.length} need attention`);
           if (changed.size) return text(`${changed.size} PR(s) need you (marked *). Run babysit_status on them for details.\n${report(now, changed)}`);
         }
         return text(`No PR changed in a way that needs you; call babysit_watch again to keep waiting.\n${report(await snap(), new Set())}`);
@@ -201,8 +194,8 @@ export function createServer(): McpServer {
     },
     async ({ pr, repo, checks, only_flaky, dry_run }) => {
       try {
-        const ref = await resolvePr(pr, repo);
-        const d = await digestFor(ref, true);
+        const { ref, config } = await contextFor(pr, repo);
+        const d = await digestFor(ref, config, true);
         let targets = d.checks.failing;
         if (checks?.length) targets = targets.filter((c) => checks.includes(c.name));
         if (only_flaky) targets = targets.filter((c) => c.flaky?.likely);
@@ -211,13 +204,15 @@ export function createServer(): McpServer {
         if (!actions.length) return text(`Nothing to rerun.${notActions.length ? ` Not GitHub Actions (can't rerun from here): ${notActions.join(', ')}.` : ''}\n${render(d)}`);
         // Rerunning a whole run with --failed would also rerun failures the caller filtered out,
         // so when filtering, rerun the selected jobs individually (job id is in the check URL).
-        const filtered = targets.length < d.checks.failing.length;
+        const filtered = targets.length < d.checks.failing.length || config.checks.ignored.length > 0;
         const commands: string[][] = [];
+        const unidentified: string[] = [];
         const repoFlag = ['--repo', `${ref.owner}/${ref.name}`];
         if (filtered) {
           for (const c of actions) {
             const job = c.url?.match(/\/job\/(\d+)/)?.[1];
-            commands.push(job ? ['run', 'rerun', '--job', job, ...repoFlag] : ['run', 'rerun', String(c.runId), '--failed', ...repoFlag]);
+            if (job) commands.push(['run', 'rerun', '--job', job, ...repoFlag]);
+            else unidentified.push(c.name);
           }
         } else {
           for (const id of new Set(actions.map((c) => c.runId!))) commands.push(['run', 'rerun', String(id), '--failed', ...repoFlag]);
@@ -228,6 +223,7 @@ export function createServer(): McpServer {
           else out.push(await gh(args).then(() => `ok: gh ${args.slice(0, 4).join(' ')}`, (e) => `failed: ${(e as Error).message}`));
         }
         if (notActions.length) out.push(`not GitHub Actions, rerun them where they come from: ${notActions.join(', ')}`);
+        if (unidentified.length) out.push(`Cannot safely rerun selected checks without job IDs: ${unidentified.join(', ')}. A whole-run retry can include excluded checks.`);
         out.push(`checks: ${targets.map((c) => c.name).join(', ')}. Next: babysit_wait.`);
         return text(out.join('\n'));
       } catch (e) {
@@ -246,8 +242,8 @@ export function createServer(): McpServer {
     },
     async ({ pr, repo, rebase, dry_run }) => {
       try {
-        const ref = await resolvePr(pr, repo);
-        const d = await digestFor(ref, false);
+        const { ref, config } = await contextFor(pr, repo);
+        const d = await digestFor(ref, config, false);
         if (d.mergeable === 'CONFLICTING') return text(`Refusing: ${d.repo}#${d.number} conflicts with ${d.base}. Resolve locally (merge or rebase ${d.base}), then push.`);
         const args = ['pr', 'update-branch', String(ref.number), '--repo', `${ref.owner}/${ref.name}`, ...(rebase ? ['--rebase'] : [])];
         if (dry_run) return text(`would run: gh ${args.join(' ')}`);
@@ -266,19 +262,19 @@ export function createServer(): McpServer {
     {
       title: 'Add the PR to the merge queue',
       description:
-        'Queues the PR for merge: comments "@mergifyio queue" on Mergify repos, otherwise gh pr merge --auto (GitHub merge queue, or auto-merge when checks pass). Refuses drafts, conflicts, failing checks, and unresolved review threads unless force is set.',
+        'Requests a merge using mergeQueue in .agent/.babysit.json: GitHub or Mergify when configured, otherwise GitHub auto-merge without a queue. Refuses drafts, conflicts, failing checks, and unresolved review threads unless force is set.',
       inputSchema: {
         pr: prArg,
         repo: repoArg,
-        method: z.enum(['squash', 'merge', 'rebase']).optional().describe('Merge method for non-queue auto-merge (default squash)'),
+        method: z.enum(['squash', 'merge', 'rebase']).optional().describe('Merge method for non-queue auto-merge (overrides configuration, default squash)'),
         force: z.boolean().optional().describe('Queue even though babysit sees blockers'),
         dry_run: dryRunArg,
       },
     },
     async ({ pr, repo, method, force, dry_run }) => {
       try {
-        const ref = await resolvePr(pr, repo);
-        const d = await digestFor(ref, false);
+        const { ref, config } = await contextFor(pr, repo);
+        const d = await digestFor(ref, config, false);
         if (d.state !== 'open') return text(`${d.repo}#${d.number} is ${d.state}; nothing to queue.`);
         if (d.queue.inQueue) return text(`Already queued.\n${render(d)}`);
         const blockers = [
@@ -289,21 +285,17 @@ export function createServer(): McpServer {
         ].filter(Boolean);
         if (blockers.length && !force) return text(`Not queuing: ${blockers.join(', ')}. Fix them first, or pass force: true.\n${render(d)}`);
         const full = `${ref.owner}/${ref.name}`;
-        if (await usesMergify(ref, d)) {
+        if (config.mergeQueue === 'mergify') {
           const args = ['pr', 'comment', String(ref.number), '--repo', full, '--body', '@mergifyio queue'];
           if (dry_run) return text(`would run: gh ${args.join(' ')}`);
           await gh(args);
           return text(`Asked Mergify to queue ${full}#${ref.number}. Next: babysit_wait (it returns if the queue drops the PR or when it merges).`);
         }
-        const args = ['pr', 'merge', String(ref.number), '--repo', full, '--auto'];
-        if (dry_run) return text(`would run: gh ${args.join(' ')} (adds --${method ?? 'squash'} if the repo has no merge queue)`);
-        try {
-          await gh(args);
-        } catch (e) {
-          if (!/merge method|--merge|--squash|--rebase/i.test((e as Error).message)) throw e;
-          await gh([...args, `--${method ?? 'squash'}`]);
-        }
-        return text(`Queued ${full}#${ref.number} (merge queue or auto-merge). Next: babysit_wait.`);
+        const mergeMethod = method ?? config.mergeMethod;
+        const args = ['pr', 'merge', String(ref.number), '--repo', full, '--auto', ...(config.mergeQueue === 'github' ? [] : [`--${mergeMethod}`])];
+        if (dry_run) return text(`would run: gh ${args.join(' ')}`);
+        await gh(args);
+        return text(`Requested ${config.mergeQueue === 'github' ? 'GitHub merge queue' : 'GitHub auto-merge'} for ${full}#${ref.number}. Next: babysit_wait.`);
       } catch (e) {
         return fail(e instanceof GhError ? e : new Error(String(e)));
       }
