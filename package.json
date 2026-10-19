@@ -5,7 +5,9 @@
   "main": "dist/src/index.js",
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "test": "tsc && node --test dist/test/*.test.js",
+    "test:install": "node scripts/test-git-install.mjs",
     "start": "node dist/src/index.js"
   },
   "license": "UNLICENSED",
@@ -21,6 +23,11 @@
   "bin": {
     "babysit": "dist/src/index.js"
   },
+  "files": [
+    "dist/src",
+    "README.md",
+    "skills"
+  ],
   "private": true,
   "engines": {
     "node": ">=20"

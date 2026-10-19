@@ -14,30 +14,36 @@ babysit polls GitHub for the agent. The agent does not need repeated shell comma
 
 ## Install
 
-You need Node 20 or later and an authenticated `gh`. Run `gh auth status` to make sure that you are signed in.
+You need Node 20 or later, npm, Git, and an authenticated `gh`. Run `gh auth status` to make sure that you are signed in.
 
-Clone this repository. In its root directory, run:
+You can run babysit directly from GitHub. You do not need to clone or build it yourself:
 
 ```sh
-npm install && npm run build
+npx -y --package=github:iceglober/babysit babysit
 ```
+
+On the first run, npm downloads the source, installs its dependencies, and builds the server. Later runs can use npm's cache.
 
 To add babysit to Claude Code for all projects, run:
 
 ```sh
-claude mcp add --scope user babysit -- node ~/repos/iceglober/babysit/dist/src/index.js
+claude mcp add --scope user babysit -- npx -y --package=github:iceglober/babysit babysit
 ```
 
 For Codex, add this section to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.babysit]
-command = "node"
-args = ["/Users/<you>/repos/iceglober/babysit/dist/src/index.js"]
+command = "npx"
+args = ["-y", "--package=github:iceglober/babysit", "babysit"]
 tool_timeout_sec = 900
 ```
 
-Replace the path with your local build path. Start the server in the repository that you want it to watch.
+For another MCP client, use `npx` as the command with the arguments above. Start the server in the repository that you want it to watch.
+
+The GitHub command runs code from the repository's default branch. To keep a fixed version, append `#<commit-sha>` to `github:iceglober/babysit`.
+
+Only install code that you trust. If npm blocks install scripts under your security policy, approve the package's `prepare` script before installation.
 
 Keep `max_minutes` below your client's tool timeout. babysit sends progress messages while it waits.
 
@@ -156,13 +162,24 @@ Each remote pull request adds one configuration request at the start of a tool c
 
 ## Development
 
-In the babysit repository root, run the tests:
+For local development, clone this repository. In its root directory, install the dependencies and run the tests:
 
 ```sh
+npm install
 npm test
 ```
 
+`npm install` also builds the server through the `prepare` script. After source changes, run `npm run build` to update it.
+
 The tests use synthetic pull request data and temporary local repositories. They do not change GitHub.
+
+To test installation from Git with a fresh npm cache, run:
+
+```sh
+npm run test:install
+```
+
+This test needs network access to download dependencies. It starts the installed MCP server and makes sure that all six tools are available.
 
 To test a live tool through MCP, build babysit and run:
 
